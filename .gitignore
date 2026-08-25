@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+build/
+*.app/
+*.dSYM/
+*.o
+*.d
+*.swiftdeps
+*.swiftdeps~
