@@ -1,5 +1,6 @@
 import AppKit
 import Charts
+import Combine
 import SwiftUI
 
 private enum NavigationItem: String, CaseIterable, Identifiable {
@@ -32,7 +33,6 @@ private enum NavigationItem: String, CaseIterable, Identifiable {
 struct RootView: View {
     @EnvironmentObject private var engine: FocusEngine
     @State private var selection: NavigationItem = .focus
-    @State private var showExitConfirmation = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -68,7 +68,7 @@ struct RootView: View {
         .animation(.easeOut(duration: 0.2), value: engine.blockedAppName)
         .animation(.easeOut(duration: 0.25), value: engine.taintNotice)
         .animation(.easeOut(duration: 0.25), value: engine.hostsIssue)
-        .sheet(isPresented: $showExitConfirmation) {
+        .sheet(isPresented: $engine.showExitConfirmation) {
             ExitConfirmationSheet()
         }
     }
@@ -122,7 +122,7 @@ struct RootView: View {
 
             Spacer()
 
-            LockStatusPanel(showExitConfirmation: $showExitConfirmation)
+            LockStatusPanel()
                 .padding(14)
         }
         .frame(width: 230)
@@ -133,7 +133,7 @@ struct RootView: View {
     private var content: some View {
         switch selection {
         case .focus:
-            FocusView(showExitConfirmation: $showExitConfirmation)
+            FocusView()
         case .schedule:
             ScheduleView()
         case .whitelist:
@@ -146,7 +146,6 @@ struct RootView: View {
 
 private struct LockStatusPanel: View {
     @EnvironmentObject private var engine: FocusEngine
-    @Binding var showExitConfirmation: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -170,8 +169,7 @@ private struct LockStatusPanel: View {
                             if newValue {
                                 engine.setManualLock(true)
                             } else {
-                                // 关闭需过冷静期并输入确认短语
-                                showExitConfirmation = true
+                                engine.requestUnlockConfirmation()
                             }
                         }
                     )
@@ -236,8 +234,12 @@ struct ExitConfirmationSheet: View {
                 .keyboardShortcut(.cancelAction)
 
                 if !isCommitted, !isCoolingDown {
-                    Button("结束并解锁") {
-                        if engine.isSessionActive {
+                    Button(engine.quitAfterConfirmation ? "退出并解锁" : "结束并解锁") {
+                        if engine.quitAfterConfirmation {
+                            engine.prepareForConfirmedQuit {
+                                NSApp.terminate(nil)
+                            }
+                        } else if engine.isSessionActive {
                             engine.endSessionEarly()
                         } else {
                             engine.setManualLock(false)
@@ -484,7 +486,6 @@ struct BlockedBanner: View {
 
 private struct FocusView: View {
     @EnvironmentObject private var engine: FocusEngine
-    @Binding var showExitConfirmation: Bool
 
     private let durations = [25, 45, 60, 90]
     private let pomodoroFocusOptions = [15, 25, 30, 45]
@@ -568,7 +569,7 @@ private struct FocusView: View {
 
             if engine.isSessionActive {
                 Button {
-                    showExitConfirmation = true
+                    engine.requestUnlockConfirmation()
                 } label: {
                     Label("提前结束", systemImage: "stop.fill")
                         .frame(minWidth: 138)
@@ -1129,7 +1130,11 @@ private struct SlotRow: View {
             },
             set: { newValue in
                 var updated = slot
-                updated[keyPath: keyPath] = TimetableScheduler.minuteOfDay(newValue)
+                var minute = TimetableScheduler.minuteOfDay(newValue)
+                if keyPath == \.endMinute, minute == 0, slot.startMinute > 0 {
+                    minute = 24 * 60
+                }
+                updated[keyPath: keyPath] = minute
                 onUpdate(updated)
             }
         )
@@ -1161,7 +1166,7 @@ private struct WhitelistView: View {
         VStack(spacing: 0) {
             HStack(spacing: 16) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(tab == .apps ? "应用白名单" : "网站黑名单")
+                    Text(tab == .apps ? "应用白名单" : "网站允许列表")
                         .font(.system(size: 22, weight: .bold))
                     Text(headerSubtitle)
                         .font(.system(size: 12))

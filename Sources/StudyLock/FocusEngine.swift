@@ -47,6 +47,9 @@ final class FocusEngine: ObservableObject {
     @Published private(set) var hostsIssue: HostsIssue?
     @Published private(set) var sessionInterruptions = 0
     @Published private(set) var timetable: FocusTimetable = .default
+    @Published var showExitConfirmation = false
+    @Published private(set) var isPreparingToQuit = false
+    @Published private(set) var quitAfterConfirmation = false
 
     private let enforcer = LockEnforcer()
     private let hostsBlocker = HostsBlocker()
@@ -57,6 +60,7 @@ final class FocusEngine: ObservableObject {
     private var secondsSinceSample = 0
     /// 在途的浏览器扫描;非 nil 表示上一轮还没回来,本轮跳过。
     private var sweepTask: Task<Void, Never>?
+    private var sweepGeneration = 0
     private var clockTimer: Timer?
     private var blockedBannerTask: Task<Void, Never>?
     private var wasInPomodoroRest = false
@@ -83,6 +87,8 @@ final class FocusEngine: ObservableObject {
         static let proxySnapshot = "proxySnapshot.v1"
         static let timetable = "timetable.v1"
         static let dismissedSlots = "dismissedSlots.v1"
+        static let hiddenPIDs = "hiddenPIDs.v1"
+        static let blockedDomains = "blockedNetworkDomains.v1"
     }
 
     /// 心跳写入节流间隔;恢复决策的宽限期见 RecoveryDecision.heartbeatGrace。
@@ -96,7 +102,8 @@ final class FocusEngine: ObservableObject {
                 Keys.whitelist, Keys.records, Keys.session, Keys.heartbeat,
                 Keys.interruptions, Keys.manualLock, Keys.taints,
                 Keys.legacyBlockedDomains, Keys.allowedDomains, Keys.usage,
-                Keys.proxySnapshot, Keys.timetable, Keys.dismissedSlots
+                Keys.proxySnapshot, Keys.timetable, Keys.dismissedSlots,
+                Keys.hiddenPIDs, Keys.blockedDomains
             ] {
                 UserDefaults.standard.removeObject(forKey: key)
             }
@@ -113,6 +120,9 @@ final class FocusEngine: ObservableObject {
 
         enforcer.onBlocked = { [weak self] appName in
             self?.registerBlocked(appName)
+        }
+        enforcer.onHiddenAppsChanged = { [weak self] identities in
+            self?.persistHiddenApps(identities)
         }
         browserMonitor.onPermissionDenied = { [weak self] in
             self?.hostsIssue = .browserPermissionDenied
@@ -211,8 +221,9 @@ final class FocusEngine: ObservableObject {
         let elapsed = session.elapsed(at: now)
         switch session.mode {
         case .countdown:
-            let total = TimeInterval(session.countdownMinutes * 60)
-            return DurationFormatter.countdown(total - elapsed)
+            let remaining = session.plannedEnd?.timeIntervalSince(now)
+                ?? TimeInterval(session.countdownMinutes * 60) - elapsed
+            return DurationFormatter.countdown(remaining)
         case .countUp:
             return DurationFormatter.elapsed(elapsed)
         case .pomodoro:
@@ -233,7 +244,11 @@ final class FocusEngine: ObservableObject {
         let elapsed = session.elapsed(at: now)
         switch session.mode {
         case .countdown:
-            let total = Double(session.countdownMinutes * 60)
+            let total = max(
+                1,
+                session.plannedEnd?.timeIntervalSince(session.startedAt)
+                    ?? Double(session.countdownMinutes * 60)
+            )
             return min(1, max(0, elapsed / total))
         case .countUp:
             return elapsed.truncatingRemainder(dividingBy: 3600) / 3600
@@ -346,6 +361,7 @@ final class FocusEngine: ObservableObject {
         sessionInterruptions = 0
         currentUsage = UsageTally()
         blockedNetworkDomains = []
+        persistBlockedNetworkDomains()
         lastActiveBlocked = nil
         secondsSinceSample = 0
         persistSessionSnapshot(newSession)
@@ -373,6 +389,16 @@ final class FocusEngine: ObservableObject {
         syncLockState()
     }
 
+    func requestUnlockConfirmation() {
+        quitAfterConfirmation = false
+        showExitConfirmation = true
+    }
+
+    func requestQuitConfirmation() {
+        quitAfterConfirmation = true
+        showExitConfirmation = true
+    }
+
     /// 用户确认退出应用(输对短语)后的收尾:落记录、清快照,并顺带清理
     /// 旧版 hosts 残留,避免下次启动误判强退。完成后回调(terminateLater 等待)。
     func prepareForConfirmedQuit(completion: @escaping @MainActor () -> Void) {
@@ -385,6 +411,8 @@ final class FocusEngine: ObservableObject {
             syncLockState()
         }
         isQuitting = true
+        isPreparingToQuit = true
+        showExitConfirmation = false
         guard HostsBlocker.hostsContainsBlock() else {
             completion()
             return
@@ -429,8 +457,14 @@ final class FocusEngine: ObservableObject {
     /// 在最后一个时段之后追加一个 45 分钟的新时段(间隔 10 分钟,不超过午夜)。
     func addSlot() {
         let lastEnd = timetable.slots.map(\.endMinute).max() ?? 9 * 60
-        let start = min(lastEnd + 10, 23 * 60)
+        let start = lastEnd + 10
+        guard start < 24 * 60 else {
+            return
+        }
         let end = min(start + 45, 24 * 60)
+        guard end > start else {
+            return
+        }
         timetable.slots.append(TimeSlot(startMinute: start, endMinute: end))
         timetable.slots.sort { $0.startMinute < $1.startMinute }
         persistTimetable()
@@ -574,7 +608,7 @@ final class FocusEngine: ObservableObject {
 
         switch session.mode {
         case .countdown:
-            if elapsed >= TimeInterval(session.countdownMinutes * 60) {
+            if let plannedEnd = session.plannedEnd, now >= plannedEnd {
                 finishSession(session, completed: true)
             }
         case .countUp:
@@ -619,7 +653,6 @@ final class FocusEngine: ObservableObject {
             return
         }
         let remaining = TimetableScheduler.remainingSeconds(in: slot, at: now)
-        // 剩余不足 1 分钟不再开启(防止取整后立刻结束的抖动),直接视为当天已处理。
         guard remaining >= 60 else {
             dismissedSlotKeys.insert(key)
             persistDismissedSlots()
@@ -628,22 +661,24 @@ final class FocusEngine: ObservableObject {
         startScheduledSession(slot: slot, remainingSeconds: remaining)
     }
 
-    /// 开启定时专注:倒计时到时段结束(四舍五入到分钟),复用全部倒计时逻辑。
+    /// 开启定时专注:倒计时到时段结束(向上取整到分钟,避免提前解锁)。
     private func startScheduledSession(slot: TimeSlot, remainingSeconds: Int) {
-        let minutes = max(1, Int((Double(remainingSeconds) / 60).rounded()))
+        let minutes = max(1, Int((Double(remainingSeconds) / 60).rounded(.up)))
         let newSession = ActiveSession(
             mode: .countdown,
             startedAt: now,
             countdownMinutes: minutes,
             schedule: nil,
             title: sessionTitle.isEmpty ? "定时专注 \(slot.rangeText)" : sessionTitle,
-            scheduledSlotID: slot.id
+            scheduledSlotID: slot.id,
+            scheduledEndAt: now.addingTimeInterval(TimeInterval(remainingSeconds))
         )
         session = newSession
         wasInPomodoroRest = false
         sessionInterruptions = 0
         currentUsage = UsageTally()
         blockedNetworkDomains = []
+        persistBlockedNetworkDomains()
         lastActiveBlocked = nil
         secondsSinceSample = 0
         persistSessionSnapshot(newSession)
@@ -667,7 +702,9 @@ final class FocusEngine: ObservableObject {
         let plannedMinutes: Int
         switch session.mode {
         case .countdown:
-            plannedMinutes = session.countdownMinutes
+            let plannedSeconds = session.plannedEnd?.timeIntervalSince(session.startedAt)
+                ?? TimeInterval(session.countdownMinutes * 60)
+            plannedMinutes = max(1, Int((plannedSeconds / 60).rounded(.up)))
         case .countUp:
             plannedMinutes = 0
         case .pomodoro:
@@ -721,14 +758,19 @@ final class FocusEngine: ObservableObject {
         }
         let desired = isManualLockOn || sessionNeedsLock
         guard desired != isLockEnabled else {
+            if !desired {
+                restorePersistedHiddenApps()
+            }
             refreshStatusBarTitle()
             return
         }
+        sweepGeneration += 1
         isLockEnabled = desired
         if desired {
-            enforcer.start(whitelist: whitelist)
+            enforcer.start(whitelist: whitelist, previouslyHidden: loadHiddenApps())
         } else {
             enforcer.stop()
+            persistHiddenApps([])
         }
         refreshStatusBarTitle()
     }
@@ -739,11 +781,10 @@ final class FocusEngine: ObservableObject {
         guard let data = defaults.data(forKey: Keys.proxySnapshot) else {
             return
         }
-        if
-            let snapshot = try? JSONDecoder().decode(ProxySnapshot.self, from: data) {
-            _ = ProxyConfigurator.restore(snapshot)
+        if let snapshot = try? JSONDecoder().decode(ProxySnapshot.self, from: data),
+           ProxyConfigurator.restore(snapshot) {
+            defaults.removeObject(forKey: Keys.proxySnapshot)
         }
-        defaults.removeObject(forKey: Keys.proxySnapshot)
     }
 
     /// 锁定中每 2 秒采样一轮(番茄休息期与未锁定时不执法):
@@ -778,6 +819,7 @@ final class FocusEngine: ObservableObject {
         guard sweepTask == nil else {
             return
         }
+        let generation = sweepGeneration
         sweepTask = Task { [weak self] in
             guard let self else {
                 return
@@ -786,16 +828,23 @@ final class FocusEngine: ObservableObject {
                 allowedDomains: Set(self.allowedDomains)
             )
             self.sweepTask = nil
-            self.applySweepResult(result)
+            self.applySweepResult(result, generation: generation)
         }
     }
 
     /// 合并一轮浏览器扫描结果(回到主线程后调用)。
-    private func applySweepResult(_ result: BrowserMonitor.SweepResult) {
-        guard isLockEnabled, !isQuitting else {
+    private func applySweepResult(
+        _ result: BrowserMonitor.SweepResult,
+        generation: Int
+    ) {
+        guard generation == sweepGeneration, isLockEnabled, !isQuitting else {
             return
         }
-        blockedNetworkDomains.formUnion(result.blockedDomains)
+        let newDomains = result.blockedDomains.subtracting(blockedNetworkDomains)
+        if !newDomains.isEmpty {
+            blockedNetworkDomains.formUnion(newDomains)
+            persistBlockedNetworkDomains()
+        }
         if let allowed = result.activeAllowed {
             currentUsage.addSite(allowed, seconds: BrowserMonitor.sampleInterval)
         }
@@ -839,7 +888,8 @@ final class FocusEngine: ObservableObject {
         let leftoverManualLock = defaults.bool(forKey: Keys.manualLock)
 
         guard leftoverSession != nil || leftoverManualLock else {
-            // 无遗留锁定状态;清理可能残留的系统代理与 hosts 块。
+            // 无遗留锁定状态;恢复上次强退时被隐藏的应用,再清理历史残留。
+            restorePersistedHiddenApps()
             restorePersistedProxySnapshot()
             cleanUpLeftoverHostsBlock()
             return
@@ -852,6 +902,7 @@ final class FocusEngine: ObservableObject {
             let heartbeat = defaults.object(forKey: Keys.heartbeat) as? Date
             let interruptions = defaults.integer(forKey: Keys.interruptions)
             currentUsage = loadUsage()
+            blockedNetworkDomains = loadBlockedNetworkDomains()
             switch RecoveryDecision.decide(
                 session: leftoverSession,
                 lastHeartbeat: heartbeat,
@@ -860,7 +911,7 @@ final class FocusEngine: ObservableObject {
             case .resume(let resumed):
                 session = resumed
                 sessionInterruptions = interruptions
-                blockedNetworkDomains = []
+                blockedNetworkDomains = loadBlockedNetworkDomains()
                 lastActiveBlocked = nil
                 wasInPomodoroRest = false
                 isManualLockOn = false
@@ -871,6 +922,8 @@ final class FocusEngine: ObservableObject {
                 syncLockState()
                 cleanUpLeftoverHostsBlock()
             case .finalize(let endedAt, _):
+                // 会话不再恢复时,先恢复上次强退留下的隐藏应用。
+                restorePersistedHiddenApps()
                 // focusSeconds 由 finishSession 按 endedAt 重新推算,结果一致
                 finishSession(
                     leftoverSession,
@@ -937,6 +990,8 @@ final class FocusEngine: ObservableObject {
         defaults.removeObject(forKey: Keys.heartbeat)
         defaults.removeObject(forKey: Keys.interruptions)
         defaults.removeObject(forKey: Keys.usage)
+        defaults.removeObject(forKey: Keys.blockedDomains)
+        persistHiddenApps([])
     }
 
     private func loadSessionSnapshot() -> ActiveSession? {
@@ -1033,6 +1088,42 @@ final class FocusEngine: ObservableObject {
 
     private func persistWhitelist() {
         defaults.set(Array(whitelist).sorted(), forKey: Keys.whitelist)
+    }
+
+    private func persistHiddenApps(_ identities: [HiddenApplicationIdentity]) {
+        if identities.isEmpty {
+            defaults.removeObject(forKey: Keys.hiddenPIDs)
+        } else if let data = try? JSONEncoder().encode(identities) {
+            defaults.set(data, forKey: Keys.hiddenPIDs)
+        }
+    }
+
+    private func loadHiddenApps() -> [HiddenApplicationIdentity] {
+        guard let data = defaults.data(forKey: Keys.hiddenPIDs),
+              let identities = try? JSONDecoder().decode(
+                  [HiddenApplicationIdentity].self, from: data
+              ) else {
+            // 丢弃旧版仅含 PID 的不安全格式，避免 PID 复用时误解隐藏其他应用。
+            defaults.removeObject(forKey: Keys.hiddenPIDs)
+            return []
+        }
+        return identities
+    }
+
+    private func restorePersistedHiddenApps() {
+        enforcer.restore(previouslyHidden: loadHiddenApps())
+    }
+
+    private func persistBlockedNetworkDomains() {
+        if blockedNetworkDomains.isEmpty {
+            defaults.removeObject(forKey: Keys.blockedDomains)
+        } else {
+            defaults.set(Array(blockedNetworkDomains).sorted(), forKey: Keys.blockedDomains)
+        }
+    }
+
+    private func loadBlockedNetworkDomains() -> Set<String> {
+        Set(defaults.stringArray(forKey: Keys.blockedDomains) ?? [])
     }
 
     private func persistRecords() {

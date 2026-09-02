@@ -185,6 +185,15 @@ private let schedule = PomodoroSchedule(focusMinutes: 25, breakMinutes: 5, round
     #expect(record.focusedMinutes == 100)
 }
 
+@Test func subMinuteFocusDoesNotRoundUpToOneMinute() {
+    let start = Date(timeIntervalSince1970: 0)
+    let record = FocusRecord(
+        id: UUID(), startedAt: start, endedAt: start.addingTimeInterval(30),
+        mode: .countdown, plannedMinutes: 25, completed: false, focusSeconds: 30
+    )
+    #expect(record.focusedMinutes == 0)
+}
+
 // MARK: - 确认短语
 
 @Test func exitConfirmationPhraseIsDeterministicAndTimeAware() {
@@ -499,6 +508,14 @@ private func record(daysAgo: Int, from today: Date, completed: Bool = true) -> F
     #expect(DomainRule.normalize("emoji😀.com") == nil)
 }
 
+@Test func domainRuleOnlyIgnoresBlankAboutPage() {
+    #expect(DomainRule.isIgnorablePage("about:blank"))
+    #expect(DomainRule.isIgnorablePage(""))
+    #expect(!DomainRule.isIgnorablePage("file:///tmp/page.html"))
+    #expect(!DomainRule.isIgnorablePage("chrome://extensions"))
+    #expect(!DomainRule.isIgnorablePage("http://localhost:8080"))
+}
+
 @Test func domainWhitelistMatchesExactAndSubdomains() {
     let whitelist: Set<String> = ["wikipedia.org", "github.com"]
     #expect(DomainRule.isAllowed("wikipedia.org", whitelist: whitelist))
@@ -703,6 +720,13 @@ private let sampleHosts = """
     #expect(HostsFileEditor.removingBlock(from: removed) == removed)
 }
 
+@Test func unmatchedHostsBeginMarkerPreservesFollowingLines() {
+    let contents = "127.0.0.1 localhost\n\(HostsFileEditor.beginMarker)\n1.2.3.4 important.example\n"
+    let removed = HostsFileEditor.removingBlock(from: contents)
+    #expect(!removed.contains(HostsFileEditor.beginMarker))
+    #expect(removed.contains("1.2.3.4 important.example"))
+}
+
 @Test func hostsInsertionWithEmptyDomainsEqualsRemoval() {
     let inserted = HostsFileEditor.inserting(domains: ["bilibili.com"], into: sampleHosts)
     #expect(
@@ -751,6 +775,10 @@ private func enabledTimetable(
         skipDates: skip,
         forceDates: force
     )
+}
+
+@Test func midnightTimeTextUsesTwentyFourHours() {
+    #expect(TimeSlot.timeText(24 * 60) == "24:00")
 }
 
 @Test func currentSlotMatchesInsideAndMissesGap() {
@@ -874,16 +902,41 @@ private func enabledTimetable(
 
 @Test func activeSessionRoundTripsScheduledSlotID() throws {
     let slotID = UUID()
+    let start = Date(timeIntervalSince1970: 1_700_000_000)
+    let exactEnd = start.addingTimeInterval(61)
     let session = ActiveSession(
         mode: .countdown,
-        startedAt: Date(timeIntervalSince1970: 1_700_000_000),
-        countdownMinutes: 25,
+        startedAt: start,
+        countdownMinutes: 2,
         schedule: nil,
         title: "定时专注",
-        scheduledSlotID: slotID
+        scheduledSlotID: slotID,
+        scheduledEndAt: exactEnd
     )
     let data = try JSONEncoder().encode(session)
     let decoded = try JSONDecoder().decode(ActiveSession.self, from: data)
     #expect(decoded == session)
     #expect(decoded.scheduledSlotID == slotID)
+    #expect(decoded.plannedEnd == exactEnd)
+    #expect(decoded.focusSeconds(elapsed: 120) == 61)
+}
+
+@Test func hostsRemovalPairsEachBeginWithFollowingEnd() {
+    let text = """
+    127.0.0.1 localhost
+    \(HostsFileEditor.beginMarker)
+    127.0.0.1 blocked.example
+    \(HostsFileEditor.endMarker)
+    \(HostsFileEditor.beginMarker)
+    10.0.0.2 keep.example
+    """
+    let removed = HostsFileEditor.removingBlock(from: text)
+    #expect(!removed.contains("blocked.example"))
+    #expect(removed.contains("10.0.0.2 keep.example"))
+}
+
+@Test func pageClassificationHandlesBlankFragmentsAndInvalidSchemes() {
+    #expect(DomainRule.classifyPage("about:blank#blocked") == .ignore)
+    #expect(DomainRule.classifyPage("chrome://extensions") == .blocked("chrome:"))
+    #expect(DomainRule.classifyPage("https://wikipedia.org@evil.com/path") == .domain("evil.com"))
 }

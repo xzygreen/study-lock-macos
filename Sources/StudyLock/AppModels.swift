@@ -12,6 +12,29 @@ struct InstalledApp: Identifiable, Hashable {
     }
 }
 
+struct HiddenApplicationIdentity: Codable, Hashable {
+    let processIdentifier: Int32
+    let bundleIdentifier: String?
+    let bundlePath: String?
+
+    init(_ app: NSRunningApplication) {
+        processIdentifier = app.processIdentifier
+        bundleIdentifier = app.bundleIdentifier
+        bundlePath = app.bundleURL?.standardizedFileURL.path
+    }
+
+    func matches(_ app: NSRunningApplication) -> Bool {
+        guard app.processIdentifier == processIdentifier else { return false }
+        if let bundleIdentifier {
+            return app.bundleIdentifier == bundleIdentifier
+        }
+        if let bundlePath {
+            return app.bundleURL?.standardizedFileURL.path == bundlePath
+        }
+        return false
+    }
+}
+
 enum FocusMode: String, Codable, CaseIterable, Identifiable {
     case countdown
     case countUp
@@ -89,9 +112,9 @@ struct FocusRecord: Codable, Identifiable, Equatable {
 
     var focusedMinutes: Int {
         if let focusSeconds {
-            return max(1, focusSeconds / 60)
+            return max(0, focusSeconds / 60)
         }
-        return max(1, Int(endedAt.timeIntervalSince(startedAt) / 60))
+        return max(0, Int(endedAt.timeIntervalSince(startedAt) / 60))
     }
 
     /// 专注质量分;旧记录(无结束原因)为 nil。
@@ -187,9 +210,10 @@ struct ActiveSession: Equatable, Codable {
     let countdownMinutes: Int
     let schedule: PomodoroSchedule?
     let title: String
-    /// 由定时课程表自动开启时,记录来源时段 id;手动会话为 nil。
-    /// 旧版快照无此字段,解码时按 nil 处理(向后兼容)。
+    /// 由定时课程表自动开启时,记录来源时段 id 与精确结束时间;手动会话为 nil。
+    /// 旧版快照无这些字段,解码时按 nil 处理(向后兼容)。
     let scheduledSlotID: UUID?
+    let scheduledEndAt: Date?
 
     init(
         mode: FocusMode,
@@ -197,7 +221,8 @@ struct ActiveSession: Equatable, Codable {
         countdownMinutes: Int,
         schedule: PomodoroSchedule?,
         title: String,
-        scheduledSlotID: UUID? = nil
+        scheduledSlotID: UUID? = nil,
+        scheduledEndAt: Date? = nil
     ) {
         self.mode = mode
         self.startedAt = startedAt
@@ -205,10 +230,11 @@ struct ActiveSession: Equatable, Codable {
         self.schedule = schedule
         self.title = title
         self.scheduledSlotID = scheduledSlotID
+        self.scheduledEndAt = scheduledEndAt
     }
 
     enum CodingKeys: String, CodingKey {
-        case mode, startedAt, countdownMinutes, schedule, title, scheduledSlotID
+        case mode, startedAt, countdownMinutes, schedule, title, scheduledSlotID, scheduledEndAt
     }
 
     init(from decoder: Decoder) throws {
@@ -219,6 +245,7 @@ struct ActiveSession: Equatable, Codable {
         schedule = try container.decodeIfPresent(PomodoroSchedule.self, forKey: .schedule)
         title = try container.decode(String.self, forKey: .title)
         scheduledSlotID = try container.decodeIfPresent(UUID.self, forKey: .scheduledSlotID)
+        scheduledEndAt = try container.decodeIfPresent(Date.self, forKey: .scheduledEndAt)
     }
 
     func elapsed(at now: Date) -> TimeInterval {
@@ -231,7 +258,9 @@ struct ActiveSession: Equatable, Codable {
             return schedule.focusedSeconds(elapsed: elapsed)
         }
         if mode == .countdown {
-            return min(elapsed, TimeInterval(countdownMinutes * 60))
+            let planned = scheduledEndAt?.timeIntervalSince(startedAt)
+                ?? TimeInterval(countdownMinutes * 60)
+            return min(elapsed, max(0, planned))
         }
         return elapsed
     }
@@ -240,7 +269,8 @@ struct ActiveSession: Equatable, Codable {
     var plannedEnd: Date? {
         switch mode {
         case .countdown:
-            return startedAt.addingTimeInterval(TimeInterval(countdownMinutes * 60))
+            return scheduledEndAt
+                ?? startedAt.addingTimeInterval(TimeInterval(countdownMinutes * 60))
         case .countUp:
             return nil
         case .pomodoro:
@@ -488,6 +518,34 @@ enum LockPolicy {
 
 /// 屏蔽域名的规范化与校验。
 enum DomainRule {
+    enum PageDisposition: Equatable {
+        case ignore
+        case domain(String)
+        case blocked(String)
+    }
+
+    static func classifyPage(_ raw: String) -> PageDisposition {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if value.isEmpty || value == "about:blank"
+            || value.hasPrefix("about:blank?") || value.hasPrefix("about:blank#") {
+            return .ignore
+        }
+        if let domain = normalize(value) {
+            return .domain(domain)
+        }
+        if let components = URLComponents(string: value),
+           let host = components.host,
+           let domain = normalize(host) {
+            return .domain(domain)
+        }
+        let scheme = URLComponents(string: value)?.scheme
+        return .blocked(scheme.map { "\($0):" } ?? "无法识别的页面")
+    }
+
+    static func isIgnorablePage(_ raw: String) -> Bool {
+        classifyPage(raw) == .ignore
+    }
+
     /// 把用户输入(可能是完整 URL)规范化为裸域名;不合法返回 nil。
     static func normalize(_ raw: String) -> String? {
         var domain = raw
@@ -828,24 +886,34 @@ enum HostsFileEditor {
             .contains { $0.trimmingCharacters(in: .whitespaces) == beginMarker }
     }
 
-    /// 删除我们的标记块(含标记行);容忍多个块与孤立标记。
+    /// 删除我们的标记块(含标记行);孤立标记只删标记本身,不吞掉合法内容。
     static func removingBlock(from contents: String) -> String {
+        let lines = contents.components(separatedBy: "\n")
         var kept: [String] = []
-        var inBlock = false
-        for line in contents.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+        var index = 0
+        while index < lines.count {
+            let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
             if trimmed == beginMarker {
-                inBlock = true
+                let end = lines[(index + 1)...].firstIndex {
+                    $0.trimmingCharacters(in: .whitespaces) == endMarker
+                }
+                if let end {
+                    index = end + 1
+                    continue
+                }
+                index += 1
                 continue
             }
-            if trimmed == endMarker {
-                inBlock = false
-                continue
+            if trimmed != endMarker {
+                kept.append(lines[index])
             }
-            if !inBlock {
-                kept.append(line)
-            }
+            index += 1
         }
+        return normalizedHosts(kept)
+    }
+
+    private static func normalizedHosts(_ lines: [String]) -> String {
+        var kept = lines
         while kept.last?.isEmpty == true {
             kept.removeLast()
         }

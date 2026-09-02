@@ -8,14 +8,21 @@ final class LockEnforcer {
     private var observers: [NSObjectProtocol] = []
     private var scanTimer: Timer?
     private var whitelist: Set<String> = []
-    /// 被本引擎隐藏的应用 pid,解锁时 unhide 恢复。
-    private var hiddenByUs: Set<pid_t> = []
+    /// 被本引擎隐藏的应用身份,解锁时校验后 unhide 恢复。
+    private var hiddenByUs: [pid_t: HiddenApplicationIdentity] = [:]
     var onBlocked: ((String) -> Void)?
+    var onHiddenAppsChanged: (([HiddenApplicationIdentity]) -> Void)?
 
     var isRunning: Bool { scanTimer != nil }
 
-    func start(whitelist: Set<String>) {
+    func start(
+        whitelist: Set<String>,
+        previouslyHidden: [HiddenApplicationIdentity] = []
+    ) {
         self.whitelist = whitelist
+        for identity in previouslyHidden {
+            hiddenByUs[pid_t(identity.processIdentifier)] = identity
+        }
         guard scanTimer == nil else {
             enforceNow()
             return
@@ -40,7 +47,10 @@ final class LockEnforcer {
                     return
                 }
                 Task { @MainActor in
-                    self?.blockIfNeeded(app)
+                    guard let self else { return }
+                    if self.blockIfNeeded(app) {
+                        self.publishHiddenApps()
+                    }
                 }
             }
             observers.append(observer)
@@ -74,12 +84,17 @@ final class LockEnforcer {
     }
 
     private func enforceNow() {
-        NSWorkspace.shared.runningApplications.forEach(blockIfNeeded)
+        var changed = false
+        for app in NSWorkspace.shared.runningApplications where blockIfNeeded(app) {
+            changed = true
+        }
+        if changed { publishHiddenApps() }
     }
 
-    private func blockIfNeeded(_ app: NSRunningApplication) {
+    @discardableResult
+    private func blockIfNeeded(_ app: NSRunningApplication) -> Bool {
         guard app.activationPolicy == .regular, !app.isTerminated else {
-            return
+            return false
         }
 
         let isAllowed = LockPolicy.allows(
@@ -90,14 +105,16 @@ final class LockEnforcer {
             whitelist: whitelist
         )
         guard !isAllowed else {
-            return
+            return false
         }
 
         let wasFrontmost = app.isActive
+        var changed = false
         if !app.isHidden {
             // hide() 的返回值不可靠(可能返回 false 但已生效),以 isHidden 为准。
             app.hide()
-            hiddenByUs.insert(app.processIdentifier)
+            hiddenByUs[app.processIdentifier] = HiddenApplicationIdentity(app)
+            changed = true
             onBlocked?(app.localizedName ?? "未命名应用")
         }
         // 只在焦点确实被抢走时才抢回来。隐藏后系统通常已把前台交还给我们,
@@ -106,20 +123,28 @@ final class LockEnforcer {
         if wasFrontmost, !NSApp.isActive {
             NSApp.activate(ignoringOtherApps: true)
         }
+        return changed
+    }
+
+    func restore(previouslyHidden: [HiddenApplicationIdentity]) {
+        for identity in previouslyHidden {
+            hiddenByUs[pid_t(identity.processIdentifier)] = identity
+        }
+        restoreHiddenApps()
     }
 
     private func restoreHiddenApps() {
-        for pid in hiddenByUs {
-            guard
-                let app = NSRunningApplication(processIdentifier: pid),
-                !app.isTerminated,
-                app.isHidden
-            else {
-                continue
-            }
+        for (pid, identity) in hiddenByUs {
+            guard let app = NSRunningApplication(processIdentifier: pid),
+                  !app.isTerminated, app.isHidden, identity.matches(app) else { continue }
             app.unhide()
         }
         hiddenByUs.removeAll()
+        publishHiddenApps()
+    }
+
+    private func publishHiddenApps() {
+        onHiddenAppsChanged?(Array(hiddenByUs.values))
     }
 
     deinit {

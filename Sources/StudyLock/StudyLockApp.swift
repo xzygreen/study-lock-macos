@@ -14,6 +14,9 @@ struct StudyLockApp: App {
                 .onAppear {
                     appDelegate.attach(engine: engine)
                     NSApp.applicationIconImage = AppIcon.image
+                    DispatchQueue.main.async {
+                        appDelegate.registerMainWindow(NSApp.keyWindow)
+                    }
                 }
         }
         .windowStyle(.hiddenTitleBar)
@@ -29,6 +32,7 @@ struct StudyLockApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var engine: FocusEngine?
+    private weak var mainWindow: NSWindow?
     private var statusItem: StatusItemController?
 
     /// 主窗口首次出现时接上引擎并建菜单栏项(只做一次)。
@@ -40,49 +44,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController(engine: engine)
     }
 
+    func registerMainWindow(_ window: NSWindow?) {
+        guard let window else { return }
+        mainWindow = window
+        window.isReleasedWhenClosed = false
+    }
+
+    private func showMainWindow() {
+        let window = mainWindow ?? NSApp.windows.first { !($0 is NSPanel) }
+        if let window {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// 锁定期间退出应用需输入动态确认短语,防止用 Cmd+Q 绕过锁定。
-    /// 确认后先落记录、清快照、移除网站屏蔽,再放行退出(否则下次启动会误判强退)。
+    /// 有会话或锁定时,退出必须走应用内冷静期 + 确认短语,不能用 Cmd+Q 秒过。
+    /// 番茄专注阶段与应用内「提前结束」一样,直接拒绝。
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let engine, engine.isLockEnabled else {
+        guard let engine else {
             return .terminateNow
         }
-
-        let phrase = ExitConfirmation.randomPhrase(
-            now: Date(),
-            focusedMinutes: engine.isSessionActive
-                ? Int(engine.sessionFocusSeconds / 60)
-                : nil
-        )
-
-        let alert = NSAlert()
-        alert.messageText = "专注仍在进行"
-        alert.informativeText = "退出「认真」会解除应用锁定。如确定要退出,请一字不差地输入:\n\(phrase)"
-        alert.alertStyle = .warning
-
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "在此输入上面这句话"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-
-        alert.addButton(withTitle: "退出并解锁")
-        alert.addButton(withTitle: "继续专注")
-
-        let response = alert.runModal()
-        guard
-            response == .alertFirstButtonReturn,
-            ExitConfirmation.matches(field.stringValue, phrase: phrase)
-        else {
-            return .terminateCancel
+        if engine.isPreparingToQuit {
+            return .terminateNow
         }
-        engine.prepareForConfirmedQuit {
-            NSApp.reply(toApplicationShouldTerminate: true)
+        guard engine.isSessionActive || engine.isLockEnabled else {
+            return .terminateNow
         }
-        return .terminateLater
+        showMainWindow()
+        engine.requestQuitConfirmation()
+        return .terminateCancel
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 }
 

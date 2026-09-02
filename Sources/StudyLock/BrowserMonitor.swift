@@ -123,12 +123,17 @@ final class BrowserMonitor {
                 else {
                     continue
                 }
-                guard let domain = DomainRule.normalize(parts[2]) else {
-                    continue // about:blank / chrome:// 等内部页,跳过
-                }
-                if !DomainRule.isAllowed(domain, whitelist: allowedDomains) {
+                switch DomainRule.classifyPage(parts[2]) {
+                case .ignore:
+                    continue
+                case .domain(let domain):
+                    if !DomainRule.isAllowed(domain, whitelist: allowedDomains) {
+                        redirects.append((window, tab))
+                        result.blockedDomains.insert(domain)
+                    }
+                case .blocked(let category):
                     redirects.append((window, tab))
-                    result.blockedDomains.insert(domain)
+                    result.blockedDomains.insert(category)
                 }
             }
             if !redirects.isEmpty {
@@ -137,20 +142,24 @@ final class BrowserMonitor {
         }
 
         // 前台浏览器:活动标签用于时长/分心判定。
-        guard
-            isFrontmost,
-            case .value(let raw) = await runner.run(
-                activeTabSource(browserName, dialect),
-                cacheKey: "active:\(browserName)"
-            ),
-            let domain = DomainRule.normalize(raw)
-        else {
+        guard isFrontmost,
+              case .value(let raw) = await runner.run(
+                  activeTabSource(browserName, dialect),
+                  cacheKey: "active:\(browserName)"
+              ) else {
             return result
         }
-        if DomainRule.isAllowed(domain, whitelist: allowedDomains) {
-            result.activeAllowed = domain
-        } else {
-            result.activeBlocked = domain
+        switch DomainRule.classifyPage(raw) {
+        case .ignore:
+            break
+        case .domain(let domain):
+            if DomainRule.isAllowed(domain, whitelist: allowedDomains) {
+                result.activeAllowed = domain
+            } else {
+                result.activeBlocked = domain
+            }
+        case .blocked(let category):
+            result.activeBlocked = category
         }
         return result
     }

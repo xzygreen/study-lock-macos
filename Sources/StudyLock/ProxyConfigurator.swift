@@ -29,6 +29,8 @@ enum ProxyConfigurator {
             if service.autoProxyEnabled, !service.autoProxyURL.isEmpty {
                 allOK = run(["-setautoproxyurl", name, service.autoProxyURL]) && allOK
                 allOK = run(["-setautoproxystate", name, "on"]) && allOK
+            } else {
+                allOK = run(["-setautoproxystate", name, "off"]) && allOK
             }
         }
         return allOK

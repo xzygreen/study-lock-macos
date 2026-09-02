@@ -26,7 +26,10 @@ struct TimeSlot: Codable, Identifiable, Equatable {
     var isValid: Bool { startMinute < endMinute && startMinute >= 0 && endMinute <= 24 * 60 }
 
     static func timeText(_ minuteOfDay: Int) -> String {
-        String(format: "%02d:%02d", minuteOfDay / 60, minuteOfDay % 60)
+        if minuteOfDay >= 24 * 60 {
+            return "24:00"
+        }
+        return String(format: "%02d:%02d", minuteOfDay / 60, minuteOfDay % 60)
     }
 
     var rangeText: String { "\(Self.timeText(startMinute)) - \(Self.timeText(endMinute))" }
