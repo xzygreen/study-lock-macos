@@ -19,9 +19,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-	<string>2.5.0</string>
+	<string>2.5.1</string>
     <key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>「认真」需要控制浏览器,以便在专注期间检查每个标签页是否在允许列表内,并统计网站使用时长。</string>
     <key>LSMinimumSystemVersion</key>
